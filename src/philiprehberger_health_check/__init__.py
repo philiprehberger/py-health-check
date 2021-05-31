@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import socket
 import time
@@ -32,29 +33,57 @@ class HealthCheck:
     """Builder for health check endpoints."""
 
     def __init__(self) -> None:
-        self._checks: list[tuple[str, Callable[[], bool]]] = []
+        self._checks: list[tuple[str, Callable[[], bool], list[str] | None]] = []
         self._start_time: float = time.perf_counter()
 
-    def add(self, name: str, fn: Callable[[], bool]) -> None:
+    def add(
+        self,
+        name: str,
+        fn: Callable[[], bool],
+        depends_on: list[str] | None = None,
+    ) -> None:
         """Add a named check function.
 
         The function should return True if healthy, or raise an exception
         to indicate failure.
+
+        Args:
+            name: Unique name for this check.
+            fn: Callable that returns True if healthy.
+            depends_on: Optional list of check names that must pass first.
+                If a dependency check failed, this check is skipped.
         """
-        self._checks.append((name, fn))
+        self._checks.append((name, fn, depends_on))
 
     def run(self) -> HealthResult:
         """Run all registered checks and return the aggregate result."""
         results: list[CheckResult] = []
         all_healthy = True
+        failed_names: set[str] = set()
 
-        for name, fn in self._checks:
+        for name, fn, depends_on in self._checks:
+            # Check if any dependency failed
+            if depends_on:
+                failed_dep = next(
+                    (dep for dep in depends_on if dep in failed_names), None
+                )
+                if failed_dep is not None:
+                    all_healthy = False
+                    failed_names.add(name)
+                    results.append(CheckResult(
+                        name=name,
+                        healthy=False,
+                        message=f"Skipped: dependency '{failed_dep}' failed",
+                    ))
+                    continue
+
             start = time.perf_counter()
             try:
                 healthy = fn()
                 duration_ms = (time.perf_counter() - start) * 1000
                 if not healthy:
                     all_healthy = False
+                    failed_names.add(name)
                 results.append(CheckResult(
                     name=name,
                     healthy=healthy,
@@ -63,6 +92,7 @@ class HealthCheck:
             except Exception as exc:
                 duration_ms = (time.perf_counter() - start) * 1000
                 all_healthy = False
+                failed_names.add(name)
                 results.append(CheckResult(
                     name=name,
                     healthy=False,
@@ -75,6 +105,92 @@ class HealthCheck:
         return HealthResult(
             status="healthy" if all_healthy else "unhealthy",
             checks=results,
+            uptime_seconds=uptime,
+        )
+
+    async def run_async(self) -> HealthResult:
+        """Run all checks concurrently using asyncio.gather.
+
+        Dependency ordering is respected: checks with dependencies wait
+        for their dependencies to complete first. Independent checks run
+        concurrently.
+
+        Returns:
+            HealthResult with results from all checks.
+        """
+        results_map: dict[str, CheckResult] = {}
+        failed_names: set[str] = set()
+        events: dict[str, asyncio.Event] = {}
+
+        for name, _, _ in self._checks:
+            events[name] = asyncio.Event()
+
+        async def _run_check(
+            name: str,
+            fn: Callable[[], bool],
+            depends_on: list[str] | None,
+        ) -> CheckResult:
+            # Wait for dependencies
+            if depends_on:
+                for dep in depends_on:
+                    if dep in events:
+                        await events[dep].wait()
+
+                failed_dep = next(
+                    (dep for dep in depends_on if dep in failed_names), None
+                )
+                if failed_dep is not None:
+                    failed_names.add(name)
+                    result = CheckResult(
+                        name=name,
+                        healthy=False,
+                        message=f"Skipped: dependency '{failed_dep}' failed",
+                    )
+                    results_map[name] = result
+                    events[name].set()
+                    return result
+
+            start = time.perf_counter()
+            try:
+                healthy = await asyncio.get_event_loop().run_in_executor(
+                    None, fn
+                )
+                duration_ms = (time.perf_counter() - start) * 1000
+                if not healthy:
+                    failed_names.add(name)
+                result = CheckResult(
+                    name=name,
+                    healthy=healthy,
+                    duration_ms=duration_ms,
+                )
+            except Exception as exc:
+                duration_ms = (time.perf_counter() - start) * 1000
+                failed_names.add(name)
+                result = CheckResult(
+                    name=name,
+                    healthy=False,
+                    message=str(exc),
+                    duration_ms=duration_ms,
+                )
+
+            results_map[name] = result
+            events[name].set()
+            return result
+
+        tasks = [
+            _run_check(name, fn, depends_on)
+            for name, fn, depends_on in self._checks
+        ]
+        await asyncio.gather(*tasks)
+
+        # Preserve original registration order
+        ordered_results = [results_map[name] for name, _, _ in self._checks]
+        all_healthy = all(r.healthy for r in ordered_results)
+        uptime = time.perf_counter() - self._start_time
+
+        return HealthResult(
+            status="healthy" if all_healthy else "unhealthy",
+            checks=ordered_results,
             uptime_seconds=uptime,
         )
 
