@@ -19,8 +19,6 @@ pip install philiprehberger-health-check
 
 ## Usage
 
-### Basic Health Check
-
 ```python
 from philiprehberger_health_check import HealthCheck, checks
 
@@ -39,6 +37,8 @@ for check in result.checks:
 ### Check Dependencies
 
 ```python
+from philiprehberger_health_check import HealthCheck
+
 hc = HealthCheck()
 hc.add("database", check_db)
 hc.add("migrations", check_migrations, depends_on=["database"])
@@ -47,10 +47,55 @@ result = hc.run()
 # If "database" fails, "migrations" is skipped automatically
 ```
 
+### Per-Check Timeouts
+
+```python
+from philiprehberger_health_check import HealthCheck
+
+hc = HealthCheck(timeout=10.0)  # global timeout
+hc.add("fast-db", check_db, timeout=2.0)  # override for this check
+hc.add("slow-report", generate_report, timeout=30.0)
+
+result = hc.run()
+# Each check uses its own timeout; others fall back to the global 10s
+```
+
+### Remediation Actions
+
+```python
+from philiprehberger_health_check import CheckResult, HealthCheck
+
+def restart_cache(result: CheckResult) -> None:
+    print(f"Restarting cache after failure: {result.message}")
+
+hc = HealthCheck()
+hc.add("cache", check_cache, on_failure=restart_cache)
+
+result = hc.run()
+# If "cache" fails, restart_cache is called automatically
+```
+
+### Check History and Metrics
+
+```python
+from philiprehberger_health_check import HealthCheck
+
+hc = HealthCheck(history_size=50)
+hc.add("database", check_db)
+
+hc.run()
+hc.run()
+hc.run()
+
+history = hc.history("database")  # list of past CheckResult objects
+rate = hc.success_rate("database")  # float between 0.0 and 1.0
+```
+
 ### Async Execution
 
 ```python
 import asyncio
+from philiprehberger_health_check import HealthCheck
 
 hc = HealthCheck()
 hc.add("database", check_db)
@@ -64,6 +109,10 @@ result = await hc.run_async()
 ### Built-in Checks
 
 ```python
+from philiprehberger_health_check import HealthCheck, checks
+
+hc = HealthCheck()
+
 # TCP connectivity
 hc.add(*checks.tcp("postgres", "db.example.com", 5432, timeout=3))
 
@@ -79,12 +128,14 @@ hc.add(*checks.custom("cache", lambda: cache.ping()))
 
 ## API
 
-| Name | Description |
-|------|-------------|
-| `HealthCheck()` | Create a health check builder |
-| `hc.add(name, fn, depends_on=None)` | Register a check with optional dependencies |
+| Function / Class | Description |
+|------------------|-------------|
+| `HealthCheck(timeout=30.0, history_size=100)` | Create a health check builder with optional global timeout and history size |
+| `hc.add(name, fn, depends_on=None, timeout=None, on_failure=None)` | Register a check with optional dependencies, per-check timeout, and failure callback |
 | `hc.run()` | Run all checks sequentially and return `HealthResult` |
 | `hc.run_async()` | Run checks concurrently, respecting dependency order |
+| `hc.history(name)` | Return list of past `CheckResult` objects for a check |
+| `hc.success_rate(name)` | Return success rate as a float between 0.0 and 1.0 |
 | `checks.tcp(name, host, port, timeout=2)` | TCP connectivity check |
 | `checks.disk_space(name, path, min_free_gb=1)` | Disk free space check |
 | `checks.memory(name, max_percent=90)` | Memory usage check (Linux) |
@@ -101,10 +152,10 @@ python -m pytest tests/ -v
 
 ## Support
 
-If you find this package useful, consider starring the repository.
+If you find this package useful, consider giving it a star on GitHub — it helps motivate continued maintenance and development.
 
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Philip%20Rehberger-blue?logo=linkedin)](https://www.linkedin.com/in/philiprehberger)
-[![More packages](https://img.shields.io/badge/More%20packages-philiprehberger-orange)](https://github.com/philiprehberger/packages)
+[![LinkedIn](https://img.shields.io/badge/Philip%20Rehberger-LinkedIn-0A66C2?logo=linkedin)](https://www.linkedin.com/in/philiprehberger)
+[![More packages](https://img.shields.io/badge/more-open%20source%20packages-blue)](https://philiprehberger.com/open-source-packages)
 
 ## License
 

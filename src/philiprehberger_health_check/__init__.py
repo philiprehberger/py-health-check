@@ -6,8 +6,12 @@ import asyncio
 import shutil
 import socket
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
+
+_DEFAULT_TIMEOUT: float = 30.0
+_DEFAULT_HISTORY_SIZE: int = 100
 
 
 @dataclass
@@ -29,18 +33,40 @@ class HealthResult:
     uptime_seconds: float = 0.0
 
 
+@dataclass
+class _CheckEntry:
+    """Internal representation of a registered check."""
+
+    name: str
+    fn: Callable[[], bool]
+    depends_on: list[str] | None
+    timeout: float | None
+    on_failure: Callable[[CheckResult], None] | None
+
+
 class HealthCheck:
     """Builder for health check endpoints."""
 
-    def __init__(self) -> None:
-        self._checks: list[tuple[str, Callable[[], bool], list[str] | None]] = []
+    def __init__(
+        self,
+        *,
+        timeout: float = _DEFAULT_TIMEOUT,
+        history_size: int = _DEFAULT_HISTORY_SIZE,
+    ) -> None:
+        self._checks: list[_CheckEntry] = []
         self._start_time: float = time.perf_counter()
+        self._timeout: float = timeout
+        self._history_size: int = history_size
+        self._history: dict[str, deque[CheckResult]] = {}
 
     def add(
         self,
         name: str,
         fn: Callable[[], bool],
         depends_on: list[str] | None = None,
+        *,
+        timeout: float | None = None,
+        on_failure: Callable[[CheckResult], None] | None = None,
     ) -> None:
         """Add a named check function.
 
@@ -52,8 +78,85 @@ class HealthCheck:
             fn: Callable that returns True if healthy.
             depends_on: Optional list of check names that must pass first.
                 If a dependency check failed, this check is skipped.
+            timeout: Per-check timeout in seconds. Overrides the global
+                timeout set on the ``HealthCheck`` instance. Defaults to
+                the global timeout.
+            on_failure: Optional callable invoked with the ``CheckResult``
+                when the check fails. Useful for automated remediation.
         """
-        self._checks.append((name, fn, depends_on))
+        self._checks.append(_CheckEntry(
+            name=name,
+            fn=fn,
+            depends_on=depends_on,
+            timeout=timeout,
+            on_failure=on_failure,
+        ))
+        if name not in self._history:
+            self._history[name] = deque(maxlen=self._history_size)
+
+    def history(self, name: str) -> list[CheckResult]:
+        """Return the list of past results for a named check.
+
+        Args:
+            name: The check name.
+
+        Returns:
+            List of ``CheckResult`` objects in chronological order.
+
+        Raises:
+            KeyError: If no check with the given name has been registered.
+        """
+        if name not in self._history:
+            raise KeyError(f"Unknown check: {name!r}")
+        return list(self._history[name])
+
+    def success_rate(self, name: str) -> float:
+        """Return the success rate for a named check as a float between 0 and 1.
+
+        If no results have been recorded yet, returns ``1.0`` (optimistic
+        default).
+
+        Args:
+            name: The check name.
+
+        Returns:
+            Float between 0.0 and 1.0.
+
+        Raises:
+            KeyError: If no check with the given name has been registered.
+        """
+        if name not in self._history:
+            raise KeyError(f"Unknown check: {name!r}")
+        entries = self._history[name]
+        if not entries:
+            return 1.0
+        return sum(1 for r in entries if r.healthy) / len(entries)
+
+    def _record_result(self, result: CheckResult) -> None:
+        """Store a result in history and run remediation if needed."""
+        if result.name in self._history:
+            self._history[result.name].append(result)
+
+    def _find_on_failure(self, name: str) -> Callable[[CheckResult], None] | None:
+        """Look up the on_failure callback for a check by name."""
+        for entry in self._checks:
+            if entry.name == name:
+                return entry.on_failure
+        return None
+
+    def _run_on_failure(self, result: CheckResult) -> None:
+        """Execute the on_failure callback if the check failed."""
+        if not result.healthy:
+            callback = self._find_on_failure(result.name)
+            if callback is not None:
+                try:
+                    callback(result)
+                except Exception:
+                    pass  # Remediation errors must not break the health check
+
+    def _resolve_timeout(self, entry: _CheckEntry) -> float:
+        """Return the effective timeout for a check entry."""
+        return entry.timeout if entry.timeout is not None else self._timeout
 
     def run(self) -> HealthResult:
         """Run all registered checks and return the aggregate result."""
@@ -61,44 +164,52 @@ class HealthCheck:
         all_healthy = True
         failed_names: set[str] = set()
 
-        for name, fn, depends_on in self._checks:
+        for entry in self._checks:
             # Check if any dependency failed
-            if depends_on:
+            if entry.depends_on:
                 failed_dep = next(
-                    (dep for dep in depends_on if dep in failed_names), None
+                    (dep for dep in entry.depends_on if dep in failed_names), None
                 )
                 if failed_dep is not None:
                     all_healthy = False
-                    failed_names.add(name)
-                    results.append(CheckResult(
-                        name=name,
+                    failed_names.add(entry.name)
+                    result = CheckResult(
+                        name=entry.name,
                         healthy=False,
                         message=f"Skipped: dependency '{failed_dep}' failed",
-                    ))
+                    )
+                    self._record_result(result)
+                    self._run_on_failure(result)
+                    results.append(result)
                     continue
 
+            effective_timeout = self._resolve_timeout(entry)
             start = time.perf_counter()
             try:
-                healthy = fn()
+                healthy = _run_with_timeout(entry.fn, effective_timeout)
                 duration_ms = (time.perf_counter() - start) * 1000
                 if not healthy:
                     all_healthy = False
-                    failed_names.add(name)
-                results.append(CheckResult(
-                    name=name,
+                    failed_names.add(entry.name)
+                result = CheckResult(
+                    name=entry.name,
                     healthy=healthy,
                     duration_ms=duration_ms,
-                ))
+                )
             except Exception as exc:
                 duration_ms = (time.perf_counter() - start) * 1000
                 all_healthy = False
-                failed_names.add(name)
-                results.append(CheckResult(
-                    name=name,
+                failed_names.add(entry.name)
+                result = CheckResult(
+                    name=entry.name,
                     healthy=False,
                     message=str(exc),
                     duration_ms=duration_ms,
-                ))
+                )
+
+            self._record_result(result)
+            self._run_on_failure(result)
+            results.append(result)
 
         uptime = time.perf_counter() - self._start_time
 
@@ -122,69 +233,77 @@ class HealthCheck:
         failed_names: set[str] = set()
         events: dict[str, asyncio.Event] = {}
 
-        for name, _, _ in self._checks:
-            events[name] = asyncio.Event()
+        for entry in self._checks:
+            events[entry.name] = asyncio.Event()
 
-        async def _run_check(
-            name: str,
-            fn: Callable[[], bool],
-            depends_on: list[str] | None,
-        ) -> CheckResult:
+        async def _run_check(entry: _CheckEntry) -> CheckResult:
             # Wait for dependencies
-            if depends_on:
-                for dep in depends_on:
+            if entry.depends_on:
+                for dep in entry.depends_on:
                     if dep in events:
                         await events[dep].wait()
 
                 failed_dep = next(
-                    (dep for dep in depends_on if dep in failed_names), None
+                    (dep for dep in entry.depends_on if dep in failed_names), None
                 )
                 if failed_dep is not None:
-                    failed_names.add(name)
+                    failed_names.add(entry.name)
                     result = CheckResult(
-                        name=name,
+                        name=entry.name,
                         healthy=False,
                         message=f"Skipped: dependency '{failed_dep}' failed",
                     )
-                    results_map[name] = result
-                    events[name].set()
+                    results_map[entry.name] = result
+                    self._record_result(result)
+                    self._run_on_failure(result)
+                    events[entry.name].set()
                     return result
 
+            effective_timeout = self._resolve_timeout(entry)
             start = time.perf_counter()
             try:
-                healthy = await asyncio.get_event_loop().run_in_executor(
-                    None, fn
+                healthy = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, entry.fn),
+                    timeout=effective_timeout,
                 )
                 duration_ms = (time.perf_counter() - start) * 1000
                 if not healthy:
-                    failed_names.add(name)
+                    failed_names.add(entry.name)
                 result = CheckResult(
-                    name=name,
+                    name=entry.name,
                     healthy=healthy,
+                    duration_ms=duration_ms,
+                )
+            except asyncio.TimeoutError:
+                duration_ms = (time.perf_counter() - start) * 1000
+                failed_names.add(entry.name)
+                result = CheckResult(
+                    name=entry.name,
+                    healthy=False,
+                    message=f"Timed out after {effective_timeout}s",
                     duration_ms=duration_ms,
                 )
             except Exception as exc:
                 duration_ms = (time.perf_counter() - start) * 1000
-                failed_names.add(name)
+                failed_names.add(entry.name)
                 result = CheckResult(
-                    name=name,
+                    name=entry.name,
                     healthy=False,
                     message=str(exc),
                     duration_ms=duration_ms,
                 )
 
-            results_map[name] = result
-            events[name].set()
+            results_map[entry.name] = result
+            self._record_result(result)
+            self._run_on_failure(result)
+            events[entry.name].set()
             return result
 
-        tasks = [
-            _run_check(name, fn, depends_on)
-            for name, fn, depends_on in self._checks
-        ]
+        tasks = [_run_check(entry) for entry in self._checks]
         await asyncio.gather(*tasks)
 
         # Preserve original registration order
-        ordered_results = [results_map[name] for name, _, _ in self._checks]
+        ordered_results = [results_map[entry.name] for entry in self._checks]
         all_healthy = all(r.healthy for r in ordered_results)
         uptime = time.perf_counter() - self._start_time
 
@@ -193,6 +312,30 @@ class HealthCheck:
             checks=ordered_results,
             uptime_seconds=uptime,
         )
+
+
+def _run_with_timeout(fn: Callable[[], bool], timeout: float) -> bool:
+    """Run a callable with a timeout using a thread.
+
+    Args:
+        fn: The check function.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        The boolean result of the check function.
+
+    Raises:
+        TimeoutError: If the function does not complete within the timeout.
+        Exception: Any exception raised by the function.
+    """
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"Timed out after {timeout}s") from None
 
 
 class checks:
