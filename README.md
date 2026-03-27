@@ -3,6 +3,7 @@
 [![Tests](https://github.com/philiprehberger/py-health-check/actions/workflows/publish.yml/badge.svg)](https://github.com/philiprehberger/py-health-check/actions/workflows/publish.yml)
 [![PyPI version](https://img.shields.io/pypi/v/philiprehberger-health-check.svg)](https://pypi.org/project/philiprehberger-health-check/)
 [![License](https://img.shields.io/github/license/philiprehberger/py-health-check)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/sponsor-GitHub%20Sponsors-ec6cb9)](https://github.com/sponsors/philiprehberger)
 
 Health check endpoint builder for web applications.
 
