@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from philiprehberger_health_check import CheckResult, HealthCheck, checks
@@ -298,3 +299,70 @@ def test_run_async_records_history() -> None:
 
     asyncio.get_event_loop().run_until_complete(hc.run_async())
     assert len(hc.history("ok")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Serialization and HTTP response
+# ---------------------------------------------------------------------------
+
+def test_to_dict_shape() -> None:
+    def _fail() -> bool:
+        raise RuntimeError("down")
+
+    hc = HealthCheck()
+    hc.add("ok", lambda: True)
+    hc.add("bad", _fail)
+
+    data = hc.run().to_dict()
+    assert set(data.keys()) == {"status", "uptime_seconds", "checks"}
+    assert len(data["checks"]) == 2
+    for entry in data["checks"]:
+        assert set(entry.keys()) == {"name", "healthy", "message", "duration_ms"}
+
+
+def test_to_dict_is_json_serializable() -> None:
+    def _fail() -> bool:
+        raise RuntimeError("down")
+
+    hc = HealthCheck()
+    hc.add("ok", lambda: True)
+    hc.add("bad", _fail)
+
+    # Should not raise
+    json.dumps(hc.run().to_dict())
+
+
+def test_to_response_healthy_returns_200() -> None:
+    hc = HealthCheck()
+    hc.add("ok", lambda: True)
+    status, body = hc.to_response()
+    assert status == 200
+    assert isinstance(body, dict)
+    assert body["status"] == "healthy"
+
+
+def test_to_response_unhealthy_returns_503() -> None:
+    def _fail() -> bool:
+        raise RuntimeError("down")
+
+    hc = HealthCheck()
+    hc.add("bad", _fail)
+    status, body = hc.to_response()
+    assert status == 503
+    assert isinstance(body, dict)
+    assert body["status"] == "unhealthy"
+
+
+def test_to_response_honors_custom_status_codes() -> None:
+    def _fail() -> bool:
+        raise RuntimeError("down")
+
+    hc_ok = HealthCheck()
+    hc_ok.add("ok", lambda: True)
+    status, _ = hc_ok.to_response(ok_status=204, fail_status=500)
+    assert status == 204
+
+    hc_bad = HealthCheck()
+    hc_bad.add("bad", _fail)
+    status, _ = hc_bad.to_response(ok_status=204, fail_status=500)
+    assert status == 500

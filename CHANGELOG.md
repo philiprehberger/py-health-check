@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0 (2026-05-30)
+
+- Add `HealthResult.to_dict()` for JSON-serializable output
+- Add `HealthCheck.to_response()` returning `(status_code, body_dict)` for web frameworks
+
 ## 0.3.1 (2026-03-31)
 
 - Standardize README to 3-badge format with emoji Support section

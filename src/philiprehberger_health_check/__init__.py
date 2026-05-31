@@ -8,7 +8,7 @@ import socket
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 _DEFAULT_TIMEOUT: float = 30.0
 _DEFAULT_HISTORY_SIZE: int = 100
@@ -31,6 +31,22 @@ class HealthResult:
     status: str
     checks: list[CheckResult] = field(default_factory=list)
     uptime_seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict suitable for an HTTP response."""
+        return {
+            "status": self.status,
+            "uptime_seconds": self.uptime_seconds,
+            "checks": [
+                {
+                    "name": c.name,
+                    "healthy": c.healthy,
+                    "message": c.message,
+                    "duration_ms": c.duration_ms,
+                }
+                for c in self.checks
+            ],
+        }
 
 
 @dataclass
@@ -218,6 +234,22 @@ class HealthCheck:
             checks=results,
             uptime_seconds=uptime,
         )
+
+    def to_response(
+        self,
+        *,
+        ok_status: int = 200,
+        fail_status: int = 503,
+    ) -> tuple[int, dict[str, Any]]:
+        """Run checks synchronously and return ``(http_status, body_dict)``.
+
+        Designed for use with any web framework — return value pairs an
+        HTTP status code (200 when healthy, 503 when not) with a JSON-
+        serializable body produced by ``HealthResult.to_dict``.
+        """
+        result = self.run()
+        status = ok_status if result.status == "healthy" else fail_status
+        return status, result.to_dict()
 
     async def run_async(self) -> HealthResult:
         """Run all checks concurrently using asyncio.gather.

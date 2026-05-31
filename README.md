@@ -101,6 +101,27 @@ result = await hc.run_async()
 # Independent checks run concurrently; dependencies are respected
 ```
 
+### Serializing for HTTP
+
+```python
+from philiprehberger_health_check import HealthCheck
+
+hc = HealthCheck()
+hc.add("database", lambda: True)
+
+# Convert a HealthResult into a JSON-serializable dict
+result = hc.run()
+body = result.to_dict()
+# {"status": "healthy", "uptime_seconds": 0.01, "checks": [...]}
+
+# Or get a (status_code, body_dict) tuple ready for any web framework
+status, body = hc.to_response()
+# status == 200 when healthy, 503 when unhealthy
+
+# Override the status codes if you need to
+status, body = hc.to_response(ok_status=204, fail_status=500)
+```
+
 ### Built-in Checks
 
 ```python
@@ -131,12 +152,14 @@ hc.add(*checks.custom("cache", lambda: cache.ping()))
 | `hc.run_async()` | Run checks concurrently, respecting dependency order |
 | `hc.history(name)` | Return list of past `CheckResult` objects for a check |
 | `hc.success_rate(name)` | Return success rate as a float between 0.0 and 1.0 |
+| `hc.to_response(ok_status=200, fail_status=503)` | Run checks and return `(http_status, body_dict)` for web frameworks |
 | `checks.tcp(name, host, port, timeout=2)` | TCP connectivity check |
 | `checks.disk_space(name, path, min_free_gb=1)` | Disk free space check |
 | `checks.memory(name, max_percent=90)` | Memory usage check (Linux) |
 | `checks.custom(name, fn)` | Wrap any callable as a check |
 | `CheckResult` | Dataclass: `name`, `healthy`, `message`, `duration_ms` |
 | `HealthResult` | Dataclass: `status`, `checks`, `uptime_seconds` |
+| `HealthResult.to_dict()` | Return a JSON-serializable dict suitable for an HTTP response |
 
 ## Development
 
